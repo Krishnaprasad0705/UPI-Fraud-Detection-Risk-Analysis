@@ -126,7 +126,6 @@ flowchart TD
 ├── POSTMAN_GUIDE.md             # API testing guide and sample payload documentation
 ├── README.md                    # Project documentation
 ├── TECHNICAL_DOMAIN_REPORT.md   # Domain analysis of UPI fraud mechanisms
-├── TODO.md                      # Development roadmap and milestones
 ├── email_alerts.py              # Threaded SMTP alert service for severe risk events
 ├── fraud_detection_api_new.py   # Primary Flask REST API server and dashboard backend
 ├── fraud_detection_system.py    # Core 5-layer hybrid AI fraud detector module
@@ -138,9 +137,9 @@ flowchart TD
 ├── start_streaming.py           # High-throughput mock UPI transaction stream generator
 ├── templates/
 │   ├── dashboard.html           # Full-featured SOC operations dashboard
-│   ├── insights.html            # Analytics and model performance insights page
-│   └── simple_dashboard.html   # Minimal lightweight dashboard view
+│   └── insights.html            # Analytics and model performance insights page
 ├── upi_streaming.ipynb          # Jupyter notebook for exploratory data analysis
+├── verify_project.py            # Automated end-to-end project verification suite
 └── view_transactions.py         # Terminal utility to inspect stored DB transactions
 ```
 

@@ -1,5 +1,33 @@
+# Environment & Secrets
 .env
+.env.*
+!.env.example
+
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ruff_cache/
+
+# Runtime Logs
 *.log
+.alerts_dispatched.log
+api-error.log
+api.log
+streaming-error.log
+streaming.log
+
+# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
+# IDE & Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
