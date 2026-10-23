@@ -1,3 +1,10 @@
+import sys
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 import os
 """
 ==============================================================================
@@ -33,10 +40,11 @@ _load_project_dotenv()
 
 # Database Configuration
 DB_CONFIG = {
-    'username': 'root',
+    'username': os.getenv('UPI_DB_USER', 'root'),
     'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-    'host': 'localhost',
-    'database': 'upi_fraud_db'
+    'host': os.getenv('UPI_DB_HOST', 'localhost'),
+    'port': int(os.getenv('UPI_DB_PORT', '3306')),
+    'database': os.getenv('UPI_DB_NAME', 'upi_fraud_db')
 }
 
 # Streaming Configuration
@@ -59,7 +67,7 @@ print("="*70 + "\n")
 
 try:
     # Create database
-    temp_engine = create_engine(f"mysql+pymysql://{DB_CONFIG['username']}:{quote(DB_CONFIG['password'], safe='')}@{DB_CONFIG['host']}")
+    temp_engine = create_engine(f"mysql+pymysql://{DB_CONFIG['username']}:{quote(DB_CONFIG['password'], safe='')}@{DB_CONFIG['host']}:{DB_CONFIG['port']}")
     with temp_engine.connect() as conn:
         conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}"))
         conn.commit()
@@ -70,7 +78,7 @@ except Exception as e:
     exit(1)
 
 # Create engine
-engine = create_engine(f"mysql+pymysql://{DB_CONFIG['username']}:{quote(DB_CONFIG['password'], safe='')}@{DB_CONFIG['host']}/{DB_CONFIG['database']}")
+engine = create_engine(f"mysql+pymysql://{DB_CONFIG['username']}:{quote(DB_CONFIG['password'], safe='')}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
 
 # Create table
 create_table_query = """
@@ -323,6 +331,8 @@ def generate_transaction():
 stats = {'generated': 0, 'inserted': 0, 'blocked': 0, 'safe': 0, 'review': 0}
 buffer = []
 start_time = datetime.now()
+last_email_dispatch_time = 0.0
+EMAIL_COOLDOWN_SECONDS = 60.0
 
 try:
     while True:
@@ -333,8 +343,13 @@ try:
             txn = generate_transaction()
             result = fraud_detector.analyze(txn)
             txn.update(result)
+            
+            # Dispatch email for severe fraud events (with 60s cooldown during high-velocity simulation)
             if email_alert_service.is_severe(result):
-                email_alert_service.send_in_background(txn, result)
+                now_ts = time.time()
+                if (now_ts - last_email_dispatch_time) >= EMAIL_COOLDOWN_SECONDS:
+                    last_email_dispatch_time = now_ts
+                    email_alert_service.send_in_background(txn, result)
             
             stats['generated'] += 1
             if txn['classification'] == 'BLOCK': stats['blocked'] += 1
@@ -391,7 +406,7 @@ except KeyboardInterrupt:
             df = pd.DataFrame(buffer)
             df.to_sql('upi_transactions', con=engine, if_exists='append', index=False)
             print(f"💾 Flushed {len(buffer)} transactions to database")
-        except:
+        except Exception:
             pass
     
     engine.dispose()

@@ -21,7 +21,6 @@ Version: 2.0
 import numpy as np
 import pandas as pd
 import random
-import time
 import json
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -74,19 +73,22 @@ class CustomerBehaviorAnalyzer:
         profile['common_hours'][transaction['transaction_hour']] += 1
         
         # Update location patterns
-        profile['common_locations'][transaction['location']] += 1
+        if 'location' in transaction:
+            profile['common_locations'][transaction['location']] += 1
         
         # Update merchant patterns
-        profile['common_merchants'][transaction['merchant_category']] += 1
+        if 'merchant_category' in transaction:
+            profile['common_merchants'][transaction['merchant_category']] += 1
         
         # Update device patterns
-        profile['common_devices'][transaction['device_type']] += 1
+        if 'device_type' in transaction:
+            profile['common_devices'][transaction['device_type']] += 1
         
         # Update payment method patterns
-        profile['common_payment_methods'][transaction['payment_method']] += 1
+        profile['common_payment_methods'][transaction.get('payment_method', 'UPI')] += 1
         
         # Update last transaction time
-        profile['last_transaction'] = transaction['transaction_time']
+        profile['last_transaction'] = transaction.get('transaction_time', datetime.now())
         
         # Update fraud/legit counts (handle missing is_fraud key)
         is_fraud = transaction.get('is_fraud', 0)
@@ -748,6 +750,12 @@ class HybridFraudDetector:
         
         # Track transaction velocity
         self.transaction_history = defaultdict(list)
+        
+        # Transaction counters for API/dashboard fallback
+        self.total_transactions = 0
+        self.blocked_count = 0
+        self.review_count = 0
+        self.approved_count = 0
     
     def calculate_velocity(self, customer_id, current_time):
         """Calculate transaction velocity for customer"""
@@ -841,23 +849,45 @@ class HybridFraudDetector:
                 'velocity_score': velocity_info['transactions_per_minute'] * 10,
                 'reputation_score': reputation
             }
-            ml_score, _ = self.ml_detector.predict(ml_features)
+            pred = self.ml_detector.predict(ml_features)
+            if pred and isinstance(pred, (tuple, list)) and len(pred) >= 2 and pred[0] is not None:
+                ml_score, _ = pred
+            else:
+                ml_score = None
             ml_probability = ml_score
             explanation = self.ml_detector.explain(ml_features)
         
         # Step 9: Calculate hybrid score
+        # Scale rule score (max 34 points in RuleBasedDetector) to 0-100 percentage
+        scaled_rule_score = min(100.0, (rule_score / 34.0) * 100.0) if rule_score <= 34 else min(100.0, float(rule_score))
+        
         scores = {
-            'rule_based': rule_score,
-            'ml': ml_score if ml_score else rule_score,
+            'rule_based': round(scaled_rule_score, 2),
+            'ml': ml_score if ml_score is not None else round(scaled_rule_score, 2),
             'behavioral': behavioral_score,
             'device': device_score,
             'reputation': reputation_risk
         }
         
-        # Weighted average
-        final_score = 0
+        # Weighted average with normalization across active signals
+        # (Prevents 0-behavioral score for new customers from artificially suppressing high rule/ML threats)
+        active_weights = {}
         for key, weight in self.weights.items():
-            final_score += scores.get(key, 0) * weight
+            if key == 'ml' and ml_score is None:
+                continue
+            if key == 'behavioral' and behavioral_score == 0:
+                continue
+            if key == 'device' and device_score == 0:
+                continue
+            if key == 'reputation' and reputation_risk == 0:
+                continue
+            active_weights[key] = weight
+
+        weight_sum = sum(active_weights.values())
+        if weight_sum > 0:
+            final_score = sum(scores[key] * (active_weights[key] / weight_sum) for key in active_weights)
+        else:
+            final_score = scaled_rule_score
         
         # Apply blacklist penalty
         if is_blacklisted:
@@ -1207,7 +1237,7 @@ def run_fraud_detection_demo():
         result = detector.analyze_transaction(txn)
         
         # Create alert if needed
-        alert = alert_system.create_alert(result, txn)
+        alert_system.create_alert(result, txn)
         
         # Display result
         status_icon = {

@@ -1,3 +1,10 @@
+import sys
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 """
 ==============================================================================
 Fraud Detection REST API Server - With Interactive Dashboard
@@ -9,41 +16,62 @@ Provides endpoints for transaction analysis, customer profiles, and reports
 Run: python fraud_detection_api.py
 """
 
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-from datetime import datetime, timedelta
-import random
-import json
-import os
 import base64
+from datetime import datetime
+from functools import wraps
 import hashlib
 import hmac
+import json
+import os
+import random
 import threading
-from functools import wraps
-from urllib.request import Request, urlopen
-import pandas as pd
-from flask import make_response
-from sqlalchemy import create_engine, text
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-# Database Configuration
-DB_CONFIG = {
-    'username': 'root',
-    'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-    'host': 'localhost',
-    'database': 'upi_fraud_db'
-}
+from flask import Flask, jsonify, make_response, request, send_from_directory
+from flask_cors import CORS
+import pandas as pd
+from sqlalchemy import create_engine, text
 
-# Create database engine
-engine = create_engine(f"mysql+pymysql://{DB_CONFIG['username']}:{quote(DB_CONFIG['password'], safe='')}@{DB_CONFIG['host']}/{DB_CONFIG['database']}")
-
-# Import our fraud detection system
-from fraud_detection_system import (
-    HybridFraudDetector, FraudAlertSystem, ReportGenerator,
-    CustomerBehaviorAnalyzer, ReputationManager
-)
 from email_alerts import SevereRiskEmailAlert, _load_project_dotenv
+from fraud_detection_system import (
+    HybridFraudDetector, FraudAlertSystem, ReportGenerator
+)
+
 _load_project_dotenv()
+
+def get_db_config():
+    _load_project_dotenv()
+    return {
+        'username': os.getenv('UPI_DB_USER', 'root'),
+        'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
+        'host': os.getenv('UPI_DB_HOST', 'localhost'),
+        'port': int(os.getenv('UPI_DB_PORT', '3306')),
+        'database': os.getenv('UPI_DB_NAME', 'upi_fraud_db')
+    }
+
+DB_CONFIG = get_db_config()
+_db_engine = None
+_db_lock = threading.Lock()
+
+def get_db_engine():
+    global _db_engine
+    with _db_lock:
+        if _db_engine is None:
+            cfg = get_db_config()
+            pwd = quote(cfg['password'], safe='')
+            db_url = f"mysql+pymysql://{cfg['username']}:{pwd}@{cfg['host']}:{cfg['port']}/{cfg['database']}?charset=utf8mb4"
+            _db_engine = create_engine(
+                db_url,
+                pool_pre_ping=True,
+                pool_recycle=300,
+                pool_size=10,
+                max_overflow=20,
+                connect_args={'connect_timeout': 3}
+            )
+        return _db_engine
+
+engine = get_db_engine()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -189,28 +217,12 @@ def email_config():
 
 @app.route('/api/send_test_alert', methods=['GET', 'POST'])
 def send_test_alert():
-    email_alert_service.reload_config()
-    target = request.args.get('email') or email_alert_service.recipient
-    mock_txn = {
-        'customer_id': 'C_FRUD_DEMO_999',
-        'transaction_amount': 85000.0,
-        'location': 'Chennai',
-        'device_type': 'Web'
-    }
-    mock_result = {
-        'risk_score': 94.5,
-        'classification': 'BLOCK',
-        'triggered_rules': [
-            'Transaction amount > INR 50,000 (High Value)',
-            'Multiple failed login attempts detected',
-            'Unrecognized foreign device signature',
-            'Midnight velocity spike (3 transactions in 2 mins)'
-        ]
-    }
-    outcome = email_alert_service.send(mock_txn, mock_result)
+    """Protected verification endpoint for SMTP email alerts"""
+    target = request.args.get('email')
+    outcome = email_alert_service.send_test_email(target)
     return jsonify({
         'status': 'success' if outcome.get('sent') else 'failed',
-        'recipient': target,
+        'recipient': target or email_alert_service.recipient,
         'details': outcome
     })
 
@@ -230,7 +242,7 @@ def index():
     """Dashboard home page - serves the interactive dashboard"""
     try:
         return send_from_directory('templates', 'dashboard.html')
-    except Exception as e:
+    except Exception:
         # Fallback to simple response
         return jsonify({
             'status': 'running',
@@ -281,39 +293,27 @@ def health_check():
 
 @app.route('/api/stats')
 def get_stats():
-    """Get current statistics from database"""
+    """Get current statistics from database with atomic aggregation"""
     try:
-        # Create a fresh connection for each request
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
-        
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
-        
+        db_engine = get_db_engine()
         with db_engine.connect() as conn:
-            # Get total transactions
-            result = conn.execute(text("SELECT COUNT(*) as total FROM upi_transactions"))
-            total = result.fetchone()[0]
+            query = text("""
+                SELECT 
+                    COUNT(*) as total,
+                    COALESCE(SUM(CASE WHEN UPPER(classification) = 'BLOCK' THEN 1 ELSE 0 END), 0) as blocked,
+                    COALESCE(SUM(CASE WHEN UPPER(classification) = 'REVIEW' THEN 1 ELSE 0 END), 0) as review,
+                    COALESCE(SUM(CASE WHEN UPPER(classification) IN ('APPROVE', 'SAFE') THEN 1 ELSE 0 END), 0) as approved
+                FROM upi_transactions
+            """)
+            row = conn.execute(query).fetchone()
             
-            # Get blocked count
-            result = conn.execute(text("SELECT COUNT(*) as blocked FROM upi_transactions WHERE classification = 'BLOCK'"))
-            blocked = result.fetchone()[0]
-            
-            # Get review count
-            result = conn.execute(text("SELECT COUNT(*) as review FROM upi_transactions WHERE classification = 'REVIEW'"))
-            review = result.fetchone()[0]
-            
-            # Get approved count
-            result = conn.execute(text("SELECT COUNT(*) as approved FROM upi_transactions WHERE classification = 'APPROVE'"))
-            approved = result.fetchone()[0]
-        
-        db_engine.dispose()
+            if row:
+                total = int(row[0] or 0)
+                blocked = int(row[1] or 0)
+                review = int(row[2] or 0)
+                approved = int(row[3] or 0)
+            else:
+                total, blocked, review, approved = 0, 0, 0, 0
         
         return jsonify({
             'total_transactions': total,
@@ -321,14 +321,13 @@ def get_stats():
             'review': review,
             'approved': approved
         })
-    except Exception as e:
-        print(f"Database error: {e}")
-        # Fallback to in-memory counters
+    except Exception:
+        # Graceful fallback to in-memory counters without leaking DB details
         return jsonify({
-            'total_transactions': detector.total_transactions,
-            'blocked': detector.blocked_count,
-            'review': detector.review_count,
-            'approved': detector.approved_count
+            'total_transactions': getattr(detector, 'total_transactions', 0),
+            'blocked': getattr(detector, 'blocked_count', 0),
+            'review': getattr(detector, 'review_count', 0),
+            'approved': getattr(detector, 'approved_count', 0)
         })
 
 @app.route('/api/analyze', methods=['POST'])
@@ -353,7 +352,7 @@ def analyze_transaction():
         
         # Create alert if high risk
         if result['classification'] in ['BLOCK', 'REVIEW']:
-            alert = alert_system.create_alert(result, data)
+            alert_system.create_alert(result, data)
             notify_alert(result)
         notify_severe_risk_by_email(data, result)
         
@@ -445,17 +444,7 @@ def add_to_blacklist(entity_type, entity_id):
 def get_alerts():
     """Get fraud alerts from database"""
     try:
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
-        
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             # Get high-risk transactions (blocked or review)
@@ -468,8 +457,6 @@ def get_alerts():
                 LIMIT 10
             """))
             rows = result.fetchall()
-            
-        db_engine.dispose()
         
         alerts = []
         for row in rows:
@@ -496,17 +483,7 @@ def get_alerts():
 def get_recent_transactions():
     """Get recent transactions from database"""
     try:
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
-        
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             result = conn.execute(text("""
@@ -517,8 +494,6 @@ def get_recent_transactions():
                 LIMIT 10
             """))
             rows = result.fetchall()
-            
-        db_engine.dispose()
         
         transactions = []
         for row in rows:
@@ -706,17 +681,7 @@ def retrain_status():
 def export_report():
     """Export fraud detection report"""
     try:
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
-        
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             # Get summary stats
@@ -731,8 +696,6 @@ def export_report():
                 FROM upi_transactions
             """))
             row = result.fetchone()
-            
-        db_engine.dispose()
         
         report = {
             'generated_at': datetime.now().isoformat(),
@@ -779,26 +742,19 @@ def get_settings():
 def view_all_alerts():
     """Get all alerts with pagination"""
     try:
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
+        from sqlalchemy import text
         
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 50, type=int)
         offset = (page - 1) * limit
         
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             # Get total count
             result = conn.execute(text("SELECT COUNT(*) FROM upi_transactions WHERE classification IN ('BLOCK', 'REVIEW')"))
-            total = result.fetchone()[0]
+            f_row = result.fetchone()
+            total = f_row[0] if f_row else 0
             
             # Get paginated alerts
             result = conn.execute(text("""
@@ -810,8 +766,6 @@ def view_all_alerts():
                 LIMIT :limit OFFSET :offset
             """), {'limit': limit, 'offset': offset})
             rows = result.fetchall()
-            
-        db_engine.dispose()
         
         alerts = []
         for row in rows:
@@ -844,13 +798,7 @@ def export_risk_csv():
     """Export BLOCK or REVIEW CSV with reasons"""
     status = request.args.get('status', 'BLOCK')
     try:
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         query = """
             SELECT customer_id, transaction_amount, transaction_hour, location, device_type, 
@@ -865,7 +813,6 @@ def export_risk_csv():
         response = make_response(df.to_csv(index=False))
         response.headers["Content-Disposition"] = f"attachment; filename=upi_{status.lower()}_risk.csv"
         response.headers["Content-type"] = "text/csv"
-        db_engine.dispose()
         return response
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -874,8 +821,7 @@ def export_risk_csv():
 def hourly_fraud():
     """Fraud counts by hour for bar chart"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         query = """
             SELECT transaction_hour, COUNT(*) as risk_count
             FROM upi_transactions 
@@ -887,9 +833,8 @@ def hourly_fraud():
         counts = [0]*24
         for _, row in df.iterrows():
             counts[int(row['transaction_hour'])] = row['risk_count']
-        db_engine.dispose()
         return jsonify({'counts': counts})
-    except Exception as e:
+    except Exception:
         return jsonify({'counts': [0]*24})
 
 INDIAN_CITIES_GEO = [
@@ -914,8 +859,7 @@ INDIAN_CITIES_GEO = [
 def location_risk():
     """Geospatial Risk Intelligence & Top Risky Locations for India Map & Charts"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         # Query database for location-based statistics
         query = """
@@ -928,7 +872,6 @@ def location_risk():
             GROUP BY location
         """
         df = pd.read_sql(query, db_engine)
-        db_engine.dispose()
         
         db_stats = {}
         for _, row in df.iterrows():
@@ -1066,8 +1009,7 @@ def location_risk():
 def hourly_risk_avg():
     """Average risk score by hour for new line chart (replacement for fraud by hour)"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         query = """
             SELECT 
                 transaction_hour, 
@@ -1079,7 +1021,6 @@ def hourly_risk_avg():
         """
         df = pd.read_sql(query, db_engine)
         avg_risk = [round(float(row['avg_risk']) if pd.notna(row['avg_risk']) else 0, 1) for _, row in df.iterrows()]
-        db_engine.dispose()
         return jsonify({'avg_risk': avg_risk})
     except Exception as e:
         print(f"Hourly risk avg error: {e}")
@@ -1089,28 +1030,21 @@ def hourly_risk_avg():
 def view_history():
     """Get transaction history with pagination"""
     try:
-        from sqlalchemy import create_engine, text
-        from urllib.parse import quote
+        from sqlalchemy import text
         
         page = request.args.get('page', 1, type=int)
         limit = request.args.get('limit', 50, type=int)
         offset = (page - 1) * limit
         classification = request.args.get('classification', None)
         
-        db_config = {
-            'username': 'root',
-            'password': os.getenv('UPI_DB_PASSWORD', 'Password'), 
-            'host': 'localhost',
-            'database': 'upi_fraud_db'
-        }
-        
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             # Build query
             if classification:
                 result = conn.execute(text("SELECT COUNT(*) FROM upi_transactions WHERE classification = :classification"), {'classification': classification})
-                total = result.fetchone()[0]
+                f_row = result.fetchone()
+                total = f_row[0] if f_row else 0
                 
                 result = conn.execute(text("""
                     SELECT transaction_id, customer_id, transaction_amount, location, device_type, 
@@ -1122,7 +1056,8 @@ def view_history():
                 """), {'classification': classification, 'limit': limit, 'offset': offset})
             else:
                 result = conn.execute(text("SELECT COUNT(*) FROM upi_transactions"))
-                total = result.fetchone()[0]
+                f_row = result.fetchone()
+                total = f_row[0] if f_row else 0
                 
                 result = conn.execute(text("""
                     SELECT transaction_id, customer_id, transaction_amount, location, device_type, 
@@ -1133,8 +1068,6 @@ def view_history():
                 """), {'limit': limit, 'offset': offset})
             
             rows = result.fetchall()
-            
-        db_engine.dispose()
         
         transactions = []
         for row in rows:
@@ -1169,14 +1102,12 @@ def view_history():
 def api_status():
     """Health status check for live indicator"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             result = conn.execute(text("SELECT COUNT(*) FROM upi_transactions"))
-            count = result.fetchone()[0]
-        
-        db_engine.dispose()
+            s_row = result.fetchone()
+            count = s_row[0] if s_row else 0
         return jsonify({
             'status': 'connected',
             'server': 'running',
@@ -1184,7 +1115,7 @@ def api_status():
             'timestamp': datetime.now().isoformat(),
             'transactions_in_db': count
         })
-    except Exception as e:
+    except Exception:
         return jsonify({
             'status': 'disconnected',
             'server': 'error',
@@ -1196,8 +1127,7 @@ def api_status():
 def get_dashboard_data():
     """Get all dashboard data in one request"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             # Stats
@@ -1265,8 +1195,6 @@ def get_dashboard_data():
                     'triggered_rules': row[7]
                 })
         
-        db_engine.dispose()
-        
         return jsonify({
             'stats': stats,
             'hourly': {'counts': hourly_data},
@@ -1282,8 +1210,7 @@ def get_dashboard_data():
 def get_risk_data():
     """Get high-risk transaction data for CSV export"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         query = """
             SELECT transaction_id, user_id, transaction_amount, location, device_type, 
@@ -1308,8 +1235,6 @@ def get_risk_data():
                 'fraud_status': str(row['classification']),
                 'risk_reason': str(row['triggered_rules'] or 'Multiple fraud indicators')
             })
-        
-        db_engine.dispose()
         return jsonify({'risk_data': risk_data, 'count': len(risk_data)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1318,8 +1243,7 @@ def get_risk_data():
 def get_report_data():
     """Get report data for export"""
     try:
-        db_config = DB_CONFIG
-        db_engine = create_engine(f"mysql+pymysql://{db_config['username']}:{quote(db_config['password'], safe='')}@{db_config['host']}/{db_config['database']}")
+        db_engine = get_db_engine()
         
         with db_engine.connect() as conn:
             result = conn.execute(text("""
@@ -1334,8 +1258,6 @@ def get_report_data():
                 FROM upi_transactions
             """))
             row = result.fetchone()
-        
-        db_engine.dispose()
         
         return jsonify({
             'report': {

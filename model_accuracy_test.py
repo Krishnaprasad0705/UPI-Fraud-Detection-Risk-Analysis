@@ -1,5 +1,13 @@
 import sys
-sys.path.append('c:/Users/akash/Downloads/PD prjct')
+if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent))
 
 from fraud_detection_system import MLFraudDetector, pd, np
 from sklearn.model_selection import train_test_split
