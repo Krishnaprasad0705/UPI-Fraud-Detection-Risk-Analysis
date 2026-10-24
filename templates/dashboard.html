@@ -573,7 +573,9 @@
 
     <!-- JavaScript Implementation -->
     <script>
-        const API_URL = 'http://localhost:5000/api';
+        const API_URL = (typeof window !== 'undefined' && window.location && window.location.origin)
+            ? `${window.location.origin}/api`
+            : 'http://localhost:5000/api';
         const nativeFetch = window.fetch.bind(window);
         let authToken = sessionStorage.getItem('fraudShieldToken');
         
@@ -1371,12 +1373,26 @@
             }
         }
 
+        function triggerDownload(url, defaultFilename) {
+            const a = document.createElement('a');
+            a.href = url;
+            if (defaultFilename) a.setAttribute('download', defaultFilename);
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                try { document.body.removeChild(a); } catch (e) {}
+            }, 1000);
+        }
+
         function exportReport() {
-            window.open(`${API_URL}/export_report`, '_blank');
+            showToast('📄 Generating complete executive fraud report download...', 'info');
+            triggerDownload(`${API_URL}/export_report?format=csv`, 'upi_fraud_executive_summary_report.csv');
         }
 
         function exportRiskCSV() {
-            window.open(`${API_URL}/export_risk_csv?status=BLOCK`, '_blank');
+            showToast('📥 Downloading high-risk fraud data CSV...', 'info');
+            triggerDownload(`${API_URL}/export_risk_csv?status=BLOCK`, 'upi_block_risk_data.csv');
         }
 
         function viewAllAlerts() {

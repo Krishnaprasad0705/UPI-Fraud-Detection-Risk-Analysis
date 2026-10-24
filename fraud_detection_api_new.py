@@ -679,12 +679,12 @@ def retrain_status():
 
 @app.route('/api/export_report', methods=['GET'])
 def export_report():
-    """Export fraud detection report"""
+    """Export fraud detection report as CSV download or JSON"""
+    req_format = request.args.get('format', 'csv').strip().lower()
     try:
         db_engine = get_db_engine()
-        
         with db_engine.connect() as conn:
-            # Get summary stats
+            # Summary metrics
             result = conn.execute(text("""
                 SELECT 
                     COUNT(*) as total,
@@ -692,27 +692,101 @@ def export_report():
                     SUM(CASE WHEN classification = 'REVIEW' THEN 1 ELSE 0 END) as review,
                     SUM(CASE WHEN classification = 'APPROVE' THEN 1 ELSE 0 END) as approved,
                     AVG(risk_score) as avg_risk,
-                    SUM(transaction_amount) as total_amount
+                    SUM(transaction_amount) as total_amount,
+                    SUM(CASE WHEN classification = 'BLOCK' THEN transaction_amount ELSE 0 END) as fraud_amount_prevented
                 FROM upi_transactions
             """))
             row = result.fetchone()
-        
-        report = {
-            'generated_at': datetime.now().isoformat(),
-            'summary': {
-                'total_transactions': row[0] or 0,
-                'blocked': row[1] or 0,
-                'under_review': row[2] or 0,
-                'approved': row[3] or 0,
-                'average_risk_score': round(float(row[4] or 0), 2),
-                'total_amount': round(float(row[5] or 0), 2)
-            },
-            'status': 'success',
-            'message': 'Report generated successfully'
-        }
-        
-        return jsonify(report)
-        
+
+            total_tx = int(row[0] or 0)
+            blocked_tx = int(row[1] or 0)
+            review_tx = int(row[2] or 0)
+            approved_tx = int(row[3] or 0)
+            avg_risk = round(float(row[4] or 0), 2)
+            total_amt = round(float(row[5] or 0), 2)
+            prevented_amt = round(float(row[6] or 0), 2)
+
+            if req_format == 'json':
+                return jsonify({
+                    'generated_at': datetime.now().isoformat(),
+                    'summary': {
+                        'total_transactions': total_tx,
+                        'blocked': blocked_tx,
+                        'under_review': review_tx,
+                        'approved': approved_tx,
+                        'average_risk_score': avg_risk,
+                        'total_amount': total_amt,
+                        'fraud_amount_prevented': prevented_amt
+                    },
+                    'status': 'success',
+                    'message': 'Report generated successfully'
+                })
+
+            # Fetch top geographic risk corridors
+            city_df = pd.read_sql(text("""
+                SELECT location, COUNT(*) as risk_incidents, AVG(risk_score) as avg_risk
+                FROM upi_transactions
+                WHERE classification IN ('BLOCK', 'REVIEW')
+                GROUP BY location
+                ORDER BY risk_incidents DESC
+                LIMIT 10
+            """), conn)
+
+            # Fetch recent high-risk blocked records
+            blocked_df = pd.read_sql(text("""
+                SELECT customer_id, transaction_amount, transaction_hour, location, device_type,
+                       risk_score, classification, triggered_rules, transaction_time
+                FROM upi_transactions
+                WHERE classification = 'BLOCK'
+                ORDER BY transaction_id DESC
+                LIMIT 100
+            """), conn)
+
+        # Construct comprehensive executive CSV
+        lines = [
+            "================================================================================",
+            "AI-DRIVEN UPI FRAUD DETECTION & RISK ANALYSIS - EXECUTIVE SUMMARY REPORT",
+            f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Local Time",
+            "System Architecture: 5-Layer Hybrid Detection Engine (Rules + ML + Behavior + Device + Reputation)",
+            "================================================================================",
+            "",
+            "--- SECTION 1: EXECUTIVE OPERATIONS METRICS ---",
+            "Metric,Value,Unit / Context",
+            f"Total Processed Volume,{total_tx},Transactions",
+            f"Approved Volume (Safe),{approved_tx},{round((approved_tx/total_tx*100) if total_tx else 0, 2)}% Safe Rate",
+            f"Under Step-Up Review (Medium Risk),{review_tx},{round((review_tx/total_tx*100) if total_tx else 0, 2)}% Review Rate",
+            f"High-Risk Fraud Blocked (Interception),{blocked_tx},{round((blocked_tx/total_tx*100) if total_tx else 0, 2)}% Interception Rate",
+            f"Average System Risk Score,{avg_risk},Out of 100 Risk Index",
+            f"Total Transacted Volume (INR),INR {total_amt:,.2f},Gross Stream Volume",
+            f"Fraudulent Outflow Prevented (INR),INR {prevented_amt:,.2f},Direct Intercepted Value",
+            "",
+            "--- SECTION 2: TOP 10 GEOGRAPHIC THREAT CORRIDORS ---",
+            "Location,Risk_Incidents,Average_Risk_Score"
+        ]
+
+        if not city_df.empty:
+            for _, r in city_df.iterrows():
+                loc = str(r['location']).replace(',', ';')
+                lines.append(f"{loc},{r['risk_incidents']},{round(float(r['avg_risk']), 2)}")
+        else:
+            lines.append("None recorded,0,0.0")
+
+        lines.append("")
+        lines.append("--- SECTION 3: RECENT HIGH-SEVERITY BLOCKED INCIDENTS (FORENSIC AUDIT LOG) ---")
+        if not blocked_df.empty:
+            blocked_df.columns = ['Customer_ID', 'Amount_INR', 'Hour', 'Location', 'Device', 'Risk_Score_%', 'Status', 'Reasons', 'Timestamp']
+            lines.append(blocked_df.to_csv(index=False).strip())
+        else:
+            lines.append("Customer_ID,Amount_INR,Hour,Location,Device,Risk_Score_%,Status,Reasons,Timestamp")
+            lines.append("None,0,0,None,None,0,BLOCK,No blocked incidents recorded,None")
+
+        csv_content = "\n".join(lines)
+        response = make_response(csv_content.encode('utf-8-sig'))
+        response.headers["Content-Disposition"] = 'attachment; filename="upi_fraud_executive_summary_report.csv"'
+        response.headers["Content-Type"] = "text/csv; charset=utf-8"
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
+
     except Exception as e:
         return jsonify({'error': str(e), 'status': 'error'}), 500
 
@@ -796,26 +870,51 @@ def view_all_alerts():
 @app.route('/api/export_risk_csv', methods=['GET'])
 def export_risk_csv():
     """Export BLOCK or REVIEW CSV with reasons"""
-    status = request.args.get('status', 'BLOCK')
+    status_param = request.args.get('status', 'BLOCK').strip().upper()
     try:
         db_engine = get_db_engine()
+        with db_engine.connect() as conn:
+            if status_param in ('BLOCK', 'REVIEW', 'APPROVE'):
+                stmt = text("""
+                    SELECT customer_id, transaction_amount, transaction_hour, location, device_type, 
+                           risk_score, classification, triggered_rules, transaction_time
+                    FROM upi_transactions 
+                    WHERE classification = :status
+                    ORDER BY transaction_id DESC
+                    LIMIT 5000
+                """)
+                df = pd.read_sql(stmt, conn, params={'status': status_param})
+            else:
+                stmt = text("""
+                    SELECT customer_id, transaction_amount, transaction_hour, location, device_type, 
+                           risk_score, classification, triggered_rules, transaction_time
+                    FROM upi_transactions 
+                    WHERE classification IN ('BLOCK', 'REVIEW')
+                    ORDER BY transaction_id DESC
+                    LIMIT 5000
+                """)
+                df = pd.read_sql(stmt, conn)
+                status_param = 'RISK'
+
+        if df.empty:
+            df = pd.DataFrame(columns=[
+                'Customer_ID', 'Amount_INR', 'Hour', 'Location', 'Device', 
+                'Risk_Score_%', 'Status', 'Reasons', 'Timestamp'
+            ])
+        else:
+            df.columns = [
+                'Customer_ID', 'Amount_INR', 'Hour', 'Location', 'Device', 
+                'Risk_Score_%', 'Status', 'Reasons', 'Timestamp'
+            ]
         
-        query = """
-            SELECT customer_id, transaction_amount, transaction_hour, location, device_type, 
-                   risk_score, classification, triggered_rules, transaction_time
-            FROM upi_transactions 
-            WHERE classification = :status
-            ORDER BY transaction_id DESC
-        """
-        df = pd.read_sql(query, db_engine, params={'status': status})
-        df.columns = ['Customer_ID', 'Amount_₹', 'Hour', 'Location', 'Device', 'Risk_Score_%', 'Status', 'Reasons', 'Timestamp']
-        
-        response = make_response(df.to_csv(index=False))
-        response.headers["Content-Disposition"] = f"attachment; filename=upi_{status.lower()}_risk.csv"
-        response.headers["Content-type"] = "text/csv"
+        csv_data = df.to_csv(index=False, encoding='utf-8-sig')
+        response = make_response(csv_data)
+        response.headers["Content-Disposition"] = f'attachment; filename="upi_{status_param.lower()}_risk_data.csv"'
+        response.headers["Content-Type"] = "text/csv; charset=utf-8"
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return response
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e), 'status': 'error'}), 500
 
 @app.route('/api/hourly_fraud', methods=['GET'])
 def hourly_fraud():
